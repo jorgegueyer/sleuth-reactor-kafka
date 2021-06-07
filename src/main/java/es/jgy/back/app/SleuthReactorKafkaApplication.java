@@ -1,7 +1,6 @@
 package es.jgy.back.app;
 
 import lombok.extern.slf4j.Slf4j;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -9,6 +8,7 @@ import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.apache.kafka.common.serialization.IntegerSerializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -19,7 +19,6 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.server.ServerWebExchange;
-import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.kafka.receiver.KafkaReceiver;
 import reactor.kafka.receiver.ReceiverOptions;
@@ -76,10 +75,12 @@ public class SleuthReactorKafkaApplication {
 		return KafkaSender.create(tracingKafkaProducerFactory, senderOptions);
 	}
 
+	@Autowired
+	private WebClient.Builder webClientBuilder;
+
 	@Bean
 	public ApplicationRunner runner(KafkaSender<Integer, String> sender,
-									KafkaReceiver<Integer, String> receiver,
-									WebClient.Builder webClientBuilder) {
+									KafkaReceiver<Integer, String> receiver) {
 		return args -> {
 			WebClient webClient = webClientBuilder.baseUrl("http://localhost:8080").build();
 			this.sendMessages(sender);
@@ -101,35 +102,28 @@ public class SleuthReactorKafkaApplication {
 		.subscribe();
 	}
 
-	public Disposable consumeMessages(KafkaReceiver<Integer, String> receiver, WebClient webClient) {
-		return
-			receiver.receive()
-				.doOnNext(record ->
-					record.headers()
-							.forEach(header ->
-									log.info("Event message received: {} -> Event Header: {}, value: {}",
-											record.value(),
-											header.key(),
-											new String(header.value(), StandardCharsets.UTF_8)
-									)
-							)
-				)
-				.flatMap(record ->
-						webClient.get()
-								.uri("/echo/headers")
-								.retrieve()
-								.bodyToMono(String.class)
-								.doOnNext(response ->
-									log.info("Event message received: {} -> Http headers propagated: {}", record.value(), response)
+	public void consumeMessages(KafkaReceiver<Integer, String> receiver, WebClient webClient) {
+		receiver.receive()
+			.doOnNext(record ->
+				record.headers()
+						.forEach(header ->
+								log.info("Event message received: {} -> Event Header: {}, value: {}",
+										record.value(),
+										header.key(),
+										new String(header.value(), StandardCharsets.UTF_8)
 								)
-								.thenReturn(record)
-				)
-				.subscribe(record -> record.receiverOffset().acknowledge());
+						)
+			)
+			.flatMap(record ->
+					webClient.get()
+							.uri("/echo/headers")
+							.retrieve()
+							.bodyToMono(String.class)
+							.doOnNext(response ->
+								log.info("Event message received: {} -> Http headers propagated: {}", record.value(), response)
+							)
+							.thenReturn(record)
+			)
+			.subscribe(record -> record.receiverOffset().acknowledge());
 	}
-
-	@Bean
-	public NewTopic topic() {
-		return new NewTopic("test1", 1, (short) 1);
-	}
-
 }
