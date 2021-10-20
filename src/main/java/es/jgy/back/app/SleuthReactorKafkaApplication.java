@@ -12,8 +12,14 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.sleuth.CurrentTraceContext;
+import org.springframework.cloud.sleuth.Span;
+import org.springframework.cloud.sleuth.TraceContext;
+import org.springframework.cloud.sleuth.Tracer;
 import org.springframework.cloud.sleuth.instrument.kafka.TracingKafkaConsumerFactory;
 import org.springframework.cloud.sleuth.instrument.kafka.TracingKafkaProducerFactory;
+import org.springframework.cloud.sleuth.instrument.kafka.TracingKafkaPropagatorGetter;
+import org.springframework.cloud.sleuth.propagation.Propagator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -25,6 +31,8 @@ import reactor.kafka.receiver.ReceiverOptions;
 import reactor.kafka.sender.KafkaSender;
 import reactor.kafka.sender.SenderOptions;
 import reactor.kafka.sender.SenderRecord;
+import reactor.util.context.Context;
+import reactor.util.function.Tuples;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
@@ -78,11 +86,20 @@ public class SleuthReactorKafkaApplication {
 	@Autowired
 	private WebClient.Builder webClientBuilder;
 
+	@Autowired
+	private Propagator propagator;
+
+	@Autowired
+	private Tracer tracer;
+
+	@Autowired
+	private CurrentTraceContext currentTraceContext;
+
 	@Bean
 	public ApplicationRunner runner(KafkaSender<Integer, String> sender,
 									KafkaReceiver<Integer, String> receiver) {
 		return args -> {
-			WebClient webClient = webClientBuilder.baseUrl("http://localhost:8080").build();
+			WebClient webClient = webClientBuilder.baseUrl("https://httpbin.org").build();
 			this.sendMessages(sender);
 			this.consumeMessages(receiver, webClient);
 		};
@@ -92,38 +109,54 @@ public class SleuthReactorKafkaApplication {
 
 	public void sendMessages(KafkaSender<Integer, String> sender) {
 		sender.send(
-			Mono.just("Some event!: ")
-				.map(message -> {
-					int i = atomicInteger.incrementAndGet();
-					return SenderRecord.create(new ProducerRecord<>("test1", i, message + i), i);
-				})
+				Mono.just("Some event!: ")
+						.map(message -> {
+							int i = atomicInteger.incrementAndGet();
+							return SenderRecord.create(new ProducerRecord<>("test1", i, message + i), i);
+						})
 		)
 		.doOnError(e -> log.error("Send failed", e))
 		.subscribe();
 	}
 
 	public void consumeMessages(KafkaReceiver<Integer, String> receiver, WebClient webClient) {
+		// :(
 		receiver.receive()
-			.doOnNext(record ->
-				record.headers()
-						.forEach(header ->
-								log.info("Event message received: {} -> Event Header: {}, value: {}",
-										record.value(),
-										header.key(),
-										new String(header.value(), StandardCharsets.UTF_8)
-								)
-						)
-			)
-			.flatMap(record ->
-					webClient.get()
-							.uri("/echo/headers")
-							.retrieve()
-							.bodyToMono(String.class)
-							.doOnNext(response ->
-								log.info("Event message received: {} -> Http headers propagated: {}", record.value(), response)
-							)
-							.thenReturn(record)
-			)
-			.subscribe(record -> record.receiverOffset().acknowledge());
+				.map(record -> {
+					Span.Builder spanBuilder = this.propagator.extract(record, new TracingKafkaPropagatorGetter());
+					Span span = spanBuilder.start();
+					return Tuples.of(span, record);
+				})
+				.doOnNext(record -> record.getT2().headers()
+						.forEach(header -> {
+									try (Tracer.SpanInScope ws = tracer.withSpan(record.getT1())) {
+										log.info("Event message received: {} -> Event Header: {}, value: {}",
+												record.getT2().value(),
+												header.key(),
+												new String(header.value(), StandardCharsets.UTF_8)
+										);
+									}
+								}
+						))
+				.flatMap(record -> Mono.just(record)
+						.flatMap(objects -> {
+							try (Tracer.SpanInScope ws = tracer.withSpan(record.getT1())) {
+								return webClient.get()
+										.uri("/headers")
+										.retrieve()
+										.bodyToMono(String.class)
+										.doOnNext(response ->
+												log.info("Event message received: {} -> Http headers propagated: {}", record.getT2().value(), response)
+										)
+										.thenReturn(record);
+							}
+						})
+						.contextWrite(Context.of(Span.class, record.getT1(), TraceContext.class, record.getT1().context()))
+
+				)
+				.subscribe(record -> {
+					record.getT1().end();
+					record.getT2().receiverOffset().acknowledge();
+				});
 	}
 }
